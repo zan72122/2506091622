@@ -1,0 +1,158 @@
+<!--
+Approach: Dilate then erode
+Expected improvement: fills gaps before shrinking
+Parameters: kernel 3x3
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>ki67_v23_morphology_dilate_erode.html</title>
+<style>
+body{font-family:Arial,Helvetica,sans-serif;margin:1rem;}
+#canvas{max-width:100%;border:1px solid #ccc;}
+.controls{margin-top:1rem;}
+.result{font-size:1.2rem;margin-top:0.5rem;}
+</style>
+<!-- IMPORTANT: Ensure opencv.js and its companion opencv.wasm file live in the same folder as this HTML file. -->
+<script>
+  // Help OpenCV.js find the WASM file when opened from file://
+  var Module = {
+    locateFile: function (path, prefix) {
+      // path will be either "opencv_js.wasm" or "opencv.wasm" depending on version
+      return path; // both JS & WASM are in the same directory
+    }
+  };
+</script>
+<script async src="opencv.js" type="text/javascript"></script>
+</head>
+<body>
+  <h1>ki67_v23_morphology_dilate_erode.html</h1>
+  <p>Select a Ki‑67 immunostain JPEG/PNG image. The app will estimate the number of positive (brown) and negative (blue) nuclei.</p>
+
+  <input type="file" id="fileInput" accept=".jpg,.jpeg,.png">
+  <canvas id="canvas"></canvas>
+
+  <div class="result" id="result"></div>
+
+<script>
+const fileInput = document.getElementById('fileInput');
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+const resultEl = document.getElementById('result');
+
+// Wait until OpenCV.js has finished loading
+function onOpenCvReady() {
+  console.log('OpenCV.js is ready');
+}
+
+fileInput.addEventListener('change', () => {
+  if (!fileInput.files.length) return;
+  const file = fileInput.files[0];
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    const img = new Image();
+    img.onload = () => {
+      canvas.width = img.width;
+      canvas.height = img.height;
+      ctx.drawImage(img, 0, 0);
+      countCells();
+    };
+    img.src = e.target.result;
+  };
+  reader.readAsDataURL(file);
+});
+
+// ==================================================================
+// ===== APPROACH 1: LESS AGGRESSIVE CLOSE ==========================
+// ==================================================================
+function countCells() {
+  // The original version used a very large (21x21) closing kernel, which merged
+  // adjacent cells. This version reduces the kernel size to (11x11) to make the
+  // "defrag" process less aggressive, hopefully preventing over-merging.
+  if (typeof cv === 'undefined') {
+    alert('OpenCV.js has not finished loading yet.');
+    return;
+  }
+
+  // --- 1. 初期設定と色空間変換 ---
+  let src = cv.imread(canvas);
+  let lab = new cv.Mat();
+  cv.cvtColor(src, lab, cv.COLOR_RGB2Lab);
+
+  // --- 2.【Detect】全細胞核オブジェクトの検出 ---
+  // 2a. 適応的閾値処理で核の形状を大まかに捉える（この段階では断片化していても良い）
+  let lChannel = new cv.MatVector();
+  cv.split(lab, lChannel);
+  let nucleiMask = new cv.Mat();
+  cv.adaptiveThreshold(lChannel.get(0), nucleiMask, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY_INV, 81, 7);
+  lChannel.delete();
+
+  // 2b. ★★★ 最重要：デフラグ（断片統合）処理 ★★★
+  // 小さなノイズを除去
+  const openKernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(3, 3));
+  cv.dilate(nucleiMask, nucleiMask, openKernel);
+  cv.erode(nucleiMask, nucleiMask, openKernel);
+  
+  // 非常に大きなカーネルでクロージングを行い、断片を強力に接着し、一つの塊に統合する
+  // このカーネルサイズが、断片化した細胞を結合させる鍵となる
+  const defragKernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(11, 11)); // Reduced from 21
+  cv.morphologyEx(nucleiMask, nucleiMask, cv.MORPH_CLOSE, defragKernel);
+  
+  // 2c. 完全に統合されたマスクから全細胞核の輪郭をリストアップする
+  let allContours = new cv.MatVector();
+  let hierarchy = new cv.Mat();
+  cv.findContours(nucleiMask, allContours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+
+  // --- 3.【Classify】各オブジェクトを陽性/陰性に分類 ---
+  const finalPositiveContours = new cv.MatVector();
+  const finalNegativeContours = new cv.MatVector();
+  const minArea = 50; // ノイズとみなす最小面積
+
+  for (let i = 0; i < allContours.size(); ++i) {
+    const cnt = allContours.get(i);
+    if (cv.contourArea(cnt) < minArea) {
+      cnt.delete();
+      continue;
+    }
+
+    const tempMask = cv.Mat.zeros(src.rows, src.cols, cv.CV_8U);
+    cv.drawContours(tempMask, allContours, i, new cv.Scalar(255), cv.FILLED);
+    const meanLab = cv.mean(lab, tempMask);
+    tempMask.delete();
+    
+    const meanL = meanLab[0]; // 平均輝度
+    const meanB = meanLab[2]; // 平均b*値 (青-黄)
+    
+    // オブジェクト単位での判定
+    if (meanB > 140 || meanL < 100) {
+      finalPositiveContours.push_back(cnt);
+    } else {
+      finalNegativeContours.push_back(cnt);
+    }
+  }
+
+  // --- 4. 結果の集計と描画 ---
+  const positiveCount = finalPositiveContours.size();
+  const negativeCount = finalNegativeContours.size();
+  resultEl.textContent = `Positive cells: ${positiveCount} | Negative cells: ${negativeCount}`;
+  
+  ctx.lineWidth = 2;
+  ctx.strokeStyle = 'rgba(255,0,0,0.8)'; // Red for Positive
+  for (let i = 0; i < positiveCount; ++i) {
+    const rect = cv.boundingRect(finalPositiveContours.get(i));
+    ctx.strokeRect(rect.x, rect.y, rect.width, rect.height);
+  }
+  ctx.strokeStyle = 'rgba(0,0,255,0.8)'; // Blue for Negative
+  for (let i = 0; i < negativeCount; ++i) {
+    const rect = cv.boundingRect(finalNegativeContours.get(i));
+    ctx.strokeRect(rect.x, rect.y, rect.width, rect.height);
+  }
+
+  // --- 5. メモリ管理 ---
+  [src, lab, nucleiMask, openKernel, defragKernel, allContours, hierarchy, 
+  finalPositiveContours, finalNegativeContours].forEach(mat => mat.delete && mat.delete());
+}
+</script>
+</body>
+</html> 
